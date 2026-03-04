@@ -1,0 +1,328 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <RTClib.h>
+#include <EEPROM.h>
+
+// LCD & RTC
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+RTC_DS3231 rtc;
+
+// Pins
+#define ALCOHOL_SENSOR A0
+#define RELAY_PIN 7
+#define BUZZER_PIN 8
+#define IGNITION_SWITCH 9
+
+// Thresholds
+int ALCOHOL_THRESHOLD = 400;  // default threshold
+const int SENSOR_FAULT_MIN = 5;
+const int SENSOR_FAULT_MAX = 1018;
+
+// Flags & Variables
+bool engineStarted = false;
+bool lastIgnitionState = LOW;
+int logIndex = 0;
+
+// Serial & calibration
+bool cfgPlotMode = false;
+int cfgBaseline = 0;
+int cfgThreshold = ALCOHOL_THRESHOLD;
+
+// Status Codes
+#define STATUS_SAFE       0
+#define STATUS_ALCOHOL    1
+#define STATUS_FAULT      2
+#define STATUS_WARNING    3
+#define STATUS_IGN_ON     4
+#define STATUS_IGN_OFF    5
+
+// Pull-up setup for ignition
+void setupIgnition() {
+  pinMode(IGNITION_SWITCH, INPUT_PULLUP);
+}
+
+void setup() {
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(ALCOHOL_SENSOR, INPUT);
+  setupIgnition();
+
+  digitalWrite(RELAY_PIN, HIGH); // Engine OFF initially
+  digitalWrite(BUZZER_PIN, LOW);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Alcohol Sensor");
+  lcd.setCursor(0, 1);
+  lcd.print("Initializing...");
+  delay(2000);
+  lcd.clear();
+
+  Serial.begin(9600);
+
+  if (!rtc.begin()) {
+    lcd.setCursor(0, 1);
+    lcd.print("RTC Not Found!");
+    Serial.println("ERROR: RTC not found! Engine blocked!");
+    while (1);  // block engine for safety
+  }
+
+  if (rtc.lostPower()) {
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+
+  // Read last log index from EEPROM
+  logIndex = EEPROM.read(0);
+  if (logIndex >= 128) logIndex = 0;
+
+  // Load saved calibration if any
+  cfgBaseline = word(EEPROM.read(1), EEPROM.read(2));
+  cfgThreshold = word(EEPROM.read(3), EEPROM.read(4));
+  if(cfgThreshold > 0) ALCOHOL_THRESHOLD = cfgThreshold;
+}
+
+void logEvent(uint8_t status, int value) {
+  DateTime now = rtc.now();
+  int address = 1 + (logIndex * 10);
+
+  EEPROM.update(address, status);
+  EEPROM.update(address + 1, highByte(value));
+  EEPROM.update(address + 2, lowByte(value));
+  EEPROM.update(address + 3, highByte(now.year()));
+  EEPROM.update(address + 4, lowByte(now.year()));
+  EEPROM.update(address + 5, now.month());
+  EEPROM.update(address + 6, now.day());
+  EEPROM.update(address + 7, now.hour());
+  EEPROM.update(address + 8, now.minute());
+  EEPROM.update(address + 9, now.second());
+
+  // Serial print for debugging
+  Serial.print("Log "); Serial.print(logIndex); Serial.print(": ");
+  Serial.print(now.year()); Serial.print("-"); Serial.print(now.month());
+  Serial.print("-"); Serial.print(now.day()); Serial.print(" ");
+  Serial.print(now.hour()); Serial.print(":"); Serial.print(now.minute());
+  Serial.print(":"); Serial.print(now.second()); Serial.print(" | ");
+
+  switch (status) {
+    case STATUS_SAFE: Serial.print("SAFE"); break;
+    case STATUS_ALCOHOL: Serial.print("ALCOHOL"); break;
+    case STATUS_FAULT: Serial.print("FAULT"); break;
+    case STATUS_WARNING: Serial.print("WARNING"); break;
+    case STATUS_IGN_ON: Serial.print("IGNITION ON"); break;
+    case STATUS_IGN_OFF: Serial.print("IGNITION OFF"); break;
+    default: Serial.print("UNKNOWN"); break;
+  }
+  Serial.print(" | Value: "); Serial.println(value);
+
+  logIndex++;
+  if (logIndex >= 128) logIndex = 0;
+  EEPROM.update(0, logIndex);
+}
+
+// ------------------- SERIAL COMMANDS -------------------
+void handleSerial() {
+  if (!Serial.available()) return;
+  String s = Serial.readStringUntil('\n');
+  s.trim();
+  if (s.length() == 0) return;
+
+  if (s.equalsIgnoreCase("help")) {
+    Serial.println(F("Commands: readlogs, clearlogs, calibrate, plotmode on/off"));
+    return;
+  }
+
+  if (s.equalsIgnoreCase("readlogs")) {
+    readLogs();
+    return;
+  }
+
+  if (s.equalsIgnoreCase("clearlogs")) {
+    for (int i = 1; i < 128*10; i++) EEPROM.update(i, 0);
+    logIndex = 0; EEPROM.update(0, logIndex);
+    Serial.println(F("Logs cleared"));
+    return;
+  }
+
+  if (s.equalsIgnoreCase("plotmode on")) {
+    cfgPlotMode = true;
+    Serial.println(F("PlotMode ON"));
+    return;
+  }
+
+  if (s.equalsIgnoreCase("plotmode off")) {
+    cfgPlotMode = false;
+    Serial.println(F("PlotMode OFF"));
+    return;
+  }
+
+  if (s.equalsIgnoreCase("calibrate")) {
+    Serial.println(F("Calibration: Remove alcohol sources. Preheating 20s..."));
+    lcd.setCursor(0, 1);
+    lcd.print("Cal: Preheat 20s");
+    unsigned long t0 = millis();
+    while (millis() - t0 < 20000) {
+      delay(100);
+      if (Serial.available()) {
+        String x = Serial.readStringUntil('\n'); x.trim();
+        if (x.equalsIgnoreCase("abort")) {
+          Serial.println(F("Calibration aborted"));
+          lcd.setCursor(0, 1); lcd.print("Cal aborted     ");
+          return;
+        }
+      }
+    }
+
+    // Sample baseline
+    Serial.println(F("Sampling baseline..."));
+    lcd.setCursor(0, 1); lcd.print("Cal: Sampling   ");
+    long sum = 0; int n = 0;
+    for (int i = 0; i < 50; i++) { 
+      sum += analogRead(ALCOHOL_SENSOR);
+      n++;
+      delay(100);
+    }
+    int baseline = sum / n;
+    int thr = baseline + 100; // offset threshold
+
+    Serial.print(F("Baseline=")); Serial.println(baseline);
+    Serial.print(F("Threshold=")); Serial.println(thr);
+
+    Serial.println(F("Save? (y/n)"));
+    while (!Serial.available()) delay(50);
+    String ans = Serial.readStringUntil('\n'); ans.trim();
+    if (ans.equalsIgnoreCase("y") || ans.equalsIgnoreCase("yes")) {
+      cfgBaseline = baseline;
+      cfgThreshold = thr;
+      ALCOHOL_THRESHOLD = cfgThreshold;
+      EEPROM.update(1, highByte(cfgBaseline));
+      EEPROM.update(2, lowByte(cfgBaseline));
+      EEPROM.update(3, highByte(cfgThreshold));
+      EEPROM.update(4, lowByte(cfgThreshold));
+      Serial.println(F("Saved"));
+      lcd.setCursor(0, 1); lcd.print("Cal: Saved      ");
+    } else {
+      Serial.println(F("Discarded"));
+      lcd.setCursor(0, 1); lcd.print("Cal: Discarded  ");
+    }
+  }
+}
+
+// ------------------- LOOP -------------------
+void loop() {
+  handleSerial();
+
+  int alcoholValue = analogRead(ALCOHOL_SENSOR);
+  int ignitionState = digitalRead(IGNITION_SWITCH);
+
+  if(cfgPlotMode) {
+    Serial.println(alcoholValue);
+    delay(100);
+  }
+
+  lcd.setCursor(0, 0);
+  lcd.print("Alcohol: "); lcd.print(alcoholValue); lcd.print("   ");
+
+  // Ignition change detection
+  if (ignitionState != lastIgnitionState) {
+    if (ignitionState == LOW) logEvent(STATUS_IGN_OFF, alcoholValue);
+    else logEvent(STATUS_IGN_ON, alcoholValue);
+    lastIgnitionState = ignitionState;
+    if (ignitionState == LOW) engineStarted = false;
+  }
+
+  // Sensor fault
+  if (alcoholValue <= SENSOR_FAULT_MIN || alcoholValue >= SENSOR_FAULT_MAX) {
+    lcd.setCursor(0, 1); lcd.print("Sensor Fault     ");
+    digitalWrite(RELAY_PIN, HIGH);
+    digitalWrite(BUZZER_PIN, HIGH);
+    engineStarted = false;
+    logEvent(STATUS_FAULT, alcoholValue);
+    delay(1000);
+    return;
+  }
+
+  // Ignition OFF
+  if (ignitionState == LOW) {
+    lcd.setCursor(0, 1); lcd.print("Ignition OFF     ");
+    digitalWrite(RELAY_PIN, HIGH);
+    digitalWrite(BUZZER_PIN, LOW);
+    engineStarted = false;
+    delay(1000);
+    return;
+  }
+
+  // Ignition ON - before engine start
+  if (!engineStarted) {
+    if (alcoholValue > ALCOHOL_THRESHOLD) {
+      lcd.setCursor(0, 1); lcd.print("Alcohol Detected ");
+      digitalWrite(RELAY_PIN, HIGH);
+      digitalWrite(BUZZER_PIN, HIGH);
+      logEvent(STATUS_ALCOHOL, alcoholValue);
+    } else {
+      lcd.setCursor(0, 1); lcd.print("Wait 10s Check   ");
+      delay(10000);
+      alcoholValue = analogRead(ALCOHOL_SENSOR);
+      if (alcoholValue <= ALCOHOL_THRESHOLD) {
+        lcd.setCursor(0, 1); lcd.print("Engine Started   ");
+        digitalWrite(RELAY_PIN, LOW);
+        digitalWrite(BUZZER_PIN, LOW);
+        engineStarted = true;
+        logEvent(STATUS_SAFE, alcoholValue);
+      } else {
+        lcd.setCursor(0, 1); lcd.print("Alcohol Detected ");
+        digitalWrite(RELAY_PIN, HIGH);
+        digitalWrite(BUZZER_PIN, HIGH);
+        logEvent(STATUS_ALCOHOL, alcoholValue);
+      }
+    }
+  }
+  else { // Engine running
+    if (alcoholValue > ALCOHOL_THRESHOLD) {
+      lcd.setCursor(0, 1); lcd.print("Warning: Alcohol!");
+      digitalWrite(BUZZER_PIN, HIGH);
+      logEvent(STATUS_WARNING, alcoholValue);
+    } else {
+      lcd.setCursor(0, 1); lcd.print("Running Safe     ");
+      digitalWrite(BUZZER_PIN, LOW);
+    }
+    digitalWrite(RELAY_PIN, LOW);
+  }
+
+  delay(500);
+}
+
+// ------------------- READ LOGS -------------------
+void readLogs() {
+  Serial.println("==== EEPROM Logs ====");
+  for (int i = 0; i < 128; i++) {
+    int address = 1 + (i * 10);
+    uint8_t status = EEPROM.read(address);
+    uint8_t valHigh = EEPROM.read(address + 1);
+    uint8_t valLow = EEPROM.read(address + 2);
+    int value = word(valHigh, valLow);
+    int year = (EEPROM.read(address + 3) << 8) | EEPROM.read(address + 4);
+    int month = EEPROM.read(address + 5);
+    int day = EEPROM.read(address + 6);
+    int hour = EEPROM.read(address + 7);
+    int minute = EEPROM.read(address + 8);
+    int second = EEPROM.read(address + 9);
+    if (year < 2020 || year > 2099) continue;
+    Serial.print("Log "); Serial.print(i); Serial.print(": ");
+    Serial.print(year); Serial.print("-"); Serial.print(month);
+    Serial.print("-"); Serial.print(day); Serial.print(" ");
+    Serial.print(hour); Serial.print(":"); Serial.print(minute);
+    Serial.print(":"); Serial.print(second); Serial.print(" | ");
+    switch (status) {
+      case STATUS_SAFE: Serial.print("SAFE"); break;
+      case STATUS_ALCOHOL: Serial.print("ALCOHOL"); break;
+      case STATUS_FAULT: Serial.print("FAULT"); break;
+      case STATUS_WARNING: Serial.print("WARNING"); break;
+      case STATUS_IGN_ON: Serial.print("IGNITION ON"); break;
+      case STATUS_IGN_OFF: Serial.print("IGNITION OFF"); break;
+      default: Serial.print("UNKNOWN"); break;
+    }
+    Serial.print(" | Value: "); Serial.println(value);
+  }
+  Serial.println("=====================");
+}
